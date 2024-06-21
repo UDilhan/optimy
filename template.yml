@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation Template - EC2 Instance with MySQL RDS
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: String
+  DBUser:
+    Description: The database admin account username
+    Type: String
+    Default: admin
+  DBPassword:
+    Description: The database admin account password
+    Type: String
+    NoEcho: true  # Do not show the value in the AWS Console
+  DBName:
+    Description: The name of the MySQL database
+    Type: String
+    Default: mydatabase
+  DBAllocatedStorage:
+    Description: The size of the database (GB)
+    Type: Number
+    Default: 5
+
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties: 
+      CidrBlock: 10.0.0.0/16 
+      EnableDnsSupport: true 
+      EnableDnsHostnames: true 
+      Tags: 
+        - Key: Name 
+          Value: MyVPC
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties: 
+      Tags: 
+        - Key: Name 
+          Value: MyInternetGateway
+
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties: 
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties: 
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs ''
+
+  PublicSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties: 
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select 
+        - 1
+        - !GetAZs ''
+
+  RouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties: 
+      VpcId: !Ref VPC
+      Tags: 
+        - Key: Name 
+          Value: PublicRouteTable
+
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: AttachGateway
+    Properties: 
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties: 
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref RouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties: 
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref RouteTable
+
+  MySecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH and HTTP access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+
+  MyDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable MySQL access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '3306'
+          ToPort: '3306'
+          SourceSecurityGroupId: !Ref MySecurityGroup
+
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS instance
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  MyDBInstance:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      DBInstanceClass: db.t3.micro
+      Engine: MySQL
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      AllocatedStorage: !Ref DBAllocatedStorage
+      VPCSecurityGroups:
+        - !Ref MyDBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+
+  MyEC2Instance:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: AttachGateway
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      ImageId: ami-0c0e147c706360bd7
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnet1
+          GroupSet:
+            - !Ref MySecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker git
+          wget https://dev.mysql.com/get/mysql80-community-release-el9-1.noarch.rpm
+          dnf install mysql80-community-release-el9-1.noarch.rpm -y
+          yum update -y
+          dnf install mysql-community-server -y
+          service docker start
+          git clone https://github.com/UDilhan/optimy /home/ec2-user/app
+          cd /home/ec2-user/app
+          docker build -t my_php_app:latest .
+
+          # Wait for the DB to be online
+          while ! mysqladmin ping -h ${MyDBInstance.Endpoint.Address} --silent; do
+            echo 'Waiting for mysql to be reachable...'
+            sleep 2
+          done
+
+          # populate the DB with some fake data
+          mysql -h ${MyDBInstance.Endpoint.Address} -u ${DBUser} -p${DBPassword} ${DBName} <<EOF
+          CREATE TABLE IF NOT EXISTS test (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) NOT NULL
+          );
+          INSERT INTO test (name) VALUES ('test1'), ('test2'), ('test3');
+          EOF
+
+          # execute the Docker image
+          docker run -d -p 80:80 \
+            -e DB_HOST=${MyDBInstance.Endpoint.Address} \
+            -e DB_USER=${DBUser} \
+            -e DB_PASS=${DBPassword} \
+            -e DB_NAME=${DBName} \
+            my_php_app:latest
+
+Outputs:
+  InstanceId:
+    Description: The Instance ID
+    Value: !Ref MyEC2Instance
+  DBEndpoint:
+    Description: The database endpoint
+    Value: !GetAtt MyDBInstance.Endpoint.Address
